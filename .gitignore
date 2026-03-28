@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+ENV/
+*.log
+
+# Node.js
+node_modules/
+.next/
+out/
+build/
+dist/
+.npm/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Jupyter
+.ipynb_checkpoints/
+jupyter_sessions/
+!jupyter_sessions/.gitkeep
+
+# Project specific
+data/output/*
+!data/output/.gitkeep
+*.tmp
+.DS_Store
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini

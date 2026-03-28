@@ -1,0 +1,23 @@
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-pip \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir python-multipart fastapi uvicorn jupyter-client nbformat ipykernel
+RUN python3 -m ipykernel install --user
+RUN pip install --no-cache-dir pandas numpy matplotlib scipy seaborn scikit-learn pyarrow tabulate openpyxl xlrd
+
+RUN mkdir -p /mnt/data /mnt/jupyter_sessions /workspace
+
+COPY src/requirements.txt /workspace/requirements.txt
+RUN pip install --no-cache-dir -r /workspace/requirements.txt
+
+COPY src/fastapi_jupyter_server.py /workspace/fastapi_jupyter_server.py
+
+WORKDIR /workspace
+
+EXPOSE 5000
+
+CMD ["python3", "-m", "uvicorn", "fastapi_jupyter_server:app", "--host", "0.0.0.0", "--port", "5000"]
