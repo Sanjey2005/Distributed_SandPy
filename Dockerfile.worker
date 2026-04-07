@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir python-multipart fastapi uvicorn jupyter-client nbformat ipykernel
 RUN python3 -m ipykernel install --user
-RUN pip install --no-cache-dir pandas numpy matplotlib scipy seaborn scikit-learn pyarrow tabulate openpyxl xlrd
+RUN pip install --no-cache-dir pandas numpy matplotlib scipy seaborn scikit-learn pyarrow tabulate openpyxl xlrd redis httpx cloudpickle
 
 RUN mkdir -p /mnt/data /mnt/jupyter_sessions /workspace
 

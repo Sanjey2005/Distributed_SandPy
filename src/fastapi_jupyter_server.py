@@ -1,33 +1,72 @@
-from fastapi import FastAPI, UploadFile, Form, HTTPException
-import subprocess
+from typing import Dict, Optional, List, Any
+from fastapi import FastAPI, UploadFile, Form, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import uuid
 from pydantic import BaseModel
 import os
-import queue
+import sys
+import time
+import json
 import asyncio
-from jupyter_client import KernelManager
+import queue
+import redis
+import subprocess
 import nbformat
 from nbformat.v4 import new_notebook, new_code_cell
-import time
-from typing import Dict, Optional
-import redis
-import json
+from jupyter_client import KernelManager
+from llm_providers import (
+    llm_client, AVAILABLE_MODELS, LLMResponse,
+    CODE_GENERATION_SYSTEM_PROMPT, ERROR_EXPLANATION_SYSTEM_PROMPT, CODE_REVIEW_SYSTEM_PROMPT
+)
+from ai_swarm import SwarmRequest, execute_autonomous_swarm
 
+app = FastAPI(title="SandPy Worker", version="2.0.0")
+
+BASE_FOLDER = "/mnt/data"
+SESSIONS_FOLDER = "/mnt/jupyter_sessions"
 WORKER_ID = os.getenv("WORKER_ID", "worker1")
-WORKER_PORT = os.getenv("WORKER_PORT", "5000")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-app = FastAPI()
+try:
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+except Exception:
+    r = None
 
-BASE_FOLDER = f"/mnt/data/{WORKER_ID}"
-SESSIONS_FOLDER = f"/mnt/jupyter_sessions/{WORKER_ID}"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-r = None
+# ─── WebSocket Connection Manager ───────────────────────────────────────────
 
-def get_redis():
-    global r
-    if r is None:
-        r = redis.from_url(REDIS_URL, decode_responses=True)
-    return r
+class ConnectionManager:
+    def __init__(self):
+        self.active: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, job_id: str, ws: WebSocket):
+        await ws.accept()
+        self.active.setdefault(job_id, []).append(ws)
+
+    def disconnect(self, job_id: str, ws: WebSocket):
+        if job_id in self.active:
+            self.active[job_id] = [w for w in self.active[job_id] if w != ws]
+
+    async def broadcast(self, job_id: str, message: dict):
+        if job_id in self.active:
+            dead = []
+            for ws in self.active[job_id]:
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                self.active[job_id].remove(ws)
+
+manager = ConnectionManager()
+
 
 class JupyterController:
     def __init__(self, folder_path):
@@ -36,13 +75,13 @@ class JupyterController:
         self.kernel_manager = None
         self.kernel_client = None
         self._kernel_ready = False
+        self.execution_history: List[Dict] = []
 
     async def _wait_for_kernel_ready(self, timeout=30):
         start_time = time.time()
         while not self._kernel_ready:
             if time.time() - start_time > timeout:
                 raise TimeoutError("Kernel failed to start within timeout period")
-            
             try:
                 if self.kernel_manager and self.kernel_manager.is_alive():
                     self.kernel_client.execute("1+1")
@@ -54,31 +93,24 @@ class JupyterController:
                                 break
                         except queue.Empty:
                             break
-                    
                     self._kernel_ready = True
                     break
             except Exception as e:
                 print(f"Kernel init error: {str(e)}")
-                pass
-            
             await asyncio.sleep(0.1)
 
     async def create_notebook(self, notebook_name):
         os.makedirs(self.folder_path, exist_ok=True)
         self.notebook_path = os.path.join(self.folder_path, f"{notebook_name}.ipynb")
-
         nb = new_notebook()
         with open(self.notebook_path, "w") as f:
             nbformat.write(nb, f)
-
         self.kernel_manager = KernelManager()
         self.kernel_manager.start_kernel()
         self.kernel_client = self.kernel_manager.client()
         self.kernel_client.start_channels()
-
         await self._wait_for_kernel_ready()
         self._clear_output_queue()
-        
         return self.notebook_path
 
     def _clear_output_queue(self):
@@ -88,52 +120,146 @@ class JupyterController:
             except queue.Empty:
                 break
 
-    async def execute_code(self, code):
+    async def execute_code(self, code: str) -> Dict:
+        """Execute code and capture ALL output types: text, images, HTML, Plotly."""
         if not self._kernel_ready:
-            raise RuntimeError("Kernel not ready. Please wait for initialization or restart session.")
-
+            raise RuntimeError("Kernel not ready. Please wait or restart session.")
         if not self.kernel_manager.is_alive():
             self._kernel_ready = False
             raise RuntimeError("Kernel died. Please restart session.")
 
         self._clear_output_queue()
+        
+        # Inject matplotlib backend for non-interactive PNG capture
+        setup_code = """
+import matplotlib
+matplotlib.use('Agg')
+import io as _io
+import base64 as _base64
+from IPython.display import display
+"""
+        # Wrap code to intercept plt.show() and capture figures
+        wrapped_code = f"""
+{setup_code}
+_captured_images = []
+_captured_html = []
+_captured_plotly = []
 
-        msg_id = self.kernel_client.execute(code)
-        outputs = []
-        error_encountered = False
+import matplotlib.pyplot as _plt_orig
+_orig_show = _plt_orig.show
 
+def _capture_show():
+    for fig_num in _plt_orig.get_fignums():
+        fig = _plt_orig.figure(fig_num)
+        buf = _io.BytesIO()
+        fig.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
+        buf.seek(0)
+        img_b64 = _base64.b64encode(buf.read()).decode('utf-8')
+        _captured_images.append(img_b64)
+    _plt_orig.close('all')
+
+_plt_orig.show = _capture_show
+
+# ─── USER CODE ────────────────────────────────────────────────────────────────
+{code}
+# ─── END USER CODE ────────────────────────────────────────────────────────────
+
+# Auto-capture any remaining figures
+for _fig_num in _plt_orig.get_fignums():
+    _fig = _plt_orig.figure(_fig_num)
+    _buf = _io.BytesIO()
+    _fig.savefig(_buf, format='png', dpi=120, bbox_inches='tight', facecolor=_fig.get_facecolor())
+    _buf.seek(0)
+    _captured_images.append(_base64.b64encode(_buf.read()).decode('utf-8'))
+_plt_orig.close('all')
+_plt_orig.show = _orig_show
+
+# Output capture markers
+if _captured_images:
+    print(f"__IMAGES__:{{','.join(_captured_images)}}")
+"""
+        
+        msg_id = self.kernel_client.execute(wrapped_code)
+        text_outputs = []
+        images = []
+        html_outputs = []
+        plotly_data = []
+        
         while True:
             try:
                 msg = self.kernel_client.get_iopub_msg(timeout=120)
+                parent_msg_id = msg.get('parent_header', {}).get('msg_id')
+                if parent_msg_id and parent_msg_id != msg_id:
+                    continue  # Ignore delayed messages from previous executions
+                    
                 msg_type = msg['header']['msg_type']
                 content = msg['content']
-
+                
                 if msg_type == 'stream':
-                    outputs.append(content['text'])
+                    text = content['text']
+                    # Extract our special image marker
+                    if '__IMAGES__:' in text:
+                        for line in text.splitlines():
+                            if line.startswith('__IMAGES__:'):
+                                img_data = line[len('__IMAGES__:'):]
+                                images.extend([i for i in img_data.split(',') if i])
+                            else:
+                                if line.strip():
+                                    text_outputs.append(line)
+                    else:
+                        text_outputs.append(text)
+                
                 elif msg_type == 'execute_result':
-                    outputs.append(str(content['data'].get('text/plain', '')))
+                    data = content.get('data', {})
+                    if 'text/html' in data:
+                        html_outputs.append(data['text/html'])
+                    elif 'application/json' in data:
+                        # Plotly or other JSON viz
+                        plotly_data.append(data['application/json'])
+                    elif 'image/png' in data:
+                        images.append(data['image/png'])
+                    elif 'text/plain' in data:
+                        text_outputs.append(str(data['text/plain']))
+                
                 elif msg_type == 'display_data':
-                    text_data = content['data'].get('text/plain', '')
-                    if text_data:
-                        outputs.append(str(text_data))
+                    data = content.get('data', {})
+                    if 'image/png' in data:
+                        images.append(data['image/png'])
+                    elif 'text/html' in data:
+                        html_outputs.append(data['text/html'])
+                    elif 'application/json' in data:
+                        plotly_data.append(data['application/json'])
+                    elif 'text/plain' in data and data['text/plain']:
+                        text_outputs.append(str(data['text/plain']))
+                
                 elif msg_type == 'error':
-                    error_encountered = True
-                    error_msg = '\n'.join(content['traceback'])
                     raise HTTPException(
                         status_code=400,
                         detail={"error": "Execution error", "traceback": content['traceback']}
                     )
+                
                 elif msg_type == 'status' and content['execution_state'] == 'idle':
-                    if not error_encountered:
-                        break
+                    break
 
             except queue.Empty:
-                raise HTTPException(
-                    status_code=408,
-                    detail="Code execution timed out"
-                )
+                raise HTTPException(status_code=408, detail="Code execution timed out")
 
-        return '\n'.join(outputs) if outputs else ""
+        output_text = '\n'.join(text_outputs) if text_outputs else ""
+        
+        # Record in history
+        self.execution_history.append({
+            "code": code,
+            "output": output_text,
+            "images": len(images),
+            "timestamp": time.time(),
+        })
+        
+        return {
+            "output": output_text,
+            "images": images,
+            "html_outputs": html_outputs,
+            "plotly_data": plotly_data,
+        }
 
     async def reset_kernel(self):
         if self.kernel_manager:
@@ -141,6 +267,7 @@ class JupyterController:
             self.kernel_manager.restart_kernel()
             await self._wait_for_kernel_ready()
             self._clear_output_queue()
+            self.execution_history = []
 
     def cleanup(self):
         if self.kernel_client:
@@ -150,213 +277,506 @@ class JupyterController:
         if self.notebook_path and os.path.exists(self.notebook_path):
             os.remove(self.notebook_path)
 
+    def export_notebook(self) -> dict:
+        """Export session as a Jupyter notebook dict."""
+        nb = new_notebook()
+        cells = []
+        for item in self.execution_history:
+            cell = new_code_cell(source=item["code"])
+            cell.outputs = [{"output_type": "stream", "name": "stdout", "text": item["output"]}]
+            cells.append(cell)
+        nb.cells = cells
+        return nbformat.writes(nb)
+
+
 class SessionInfo:
     def __init__(self, controller, created_at: float):
         self.controller = controller
         self.created_at = created_at
         self.last_activity = created_at
 
+
 sessions: Dict[str, SessionInfo] = {}
+
 
 class ExecuteRequest(BaseModel):
     user_id: str
     code: str
 
+
 class InstallPackageRequest(BaseModel):
     user_id: str
     package_name: str
 
+class AIGenerateRequest(BaseModel):
+    prompt: str
+    model: Optional[str] = "llama-3.3-70b"
+    context: Optional[str] = None
+    user_id: str
+
+class AIExplainErrorRequest(BaseModel):
+    code: str
+    error: str
+    model: Optional[str] = "llama-3.3-70b"
+
+class AIReviewRequest(BaseModel):
+    code: str
+    model: Optional[str] = "llama-3.3-70b"
+
+class LockRequest(BaseModel):
+    user_id: str
+    action: str # "acquire" or "release"
+
+
 async def cleanup_inactive_sessions():
     while True:
         current_time = time.time()
-        to_remove = []
-        
-        for user_id, session_info in sessions.items():
-            if current_time - session_info.last_activity > 3600:
-                to_remove.append(user_id)
-        
+        to_remove = [uid for uid, si in sessions.items() if current_time - si.last_activity > 3600]
         for user_id in to_remove:
-            session_info = sessions.pop(user_id)
-            session_info.controller.cleanup()
-            try:
-                redis_conn = get_redis()
-                redis_conn.delete(f"session:{user_id}")
-            except Exception as e:
-                print(f"Failed to cleanup Redis session: {e}")
-        
+            sessions.pop(user_id).controller.cleanup()
         await asyncio.sleep(300)
 
-async def register_worker():
-    try:
-        redis_conn = get_redis()
-        worker_data = json.dumps({
-            "worker_id": WORKER_ID,
-            "port": WORKER_PORT,
-            "status": "online"
-        })
-        redis_conn.set(f"worker:{WORKER_ID}", worker_data, ex=3600)
-        print(f"Worker {WORKER_ID} registered in Redis")
-    except Exception as e:
-        print(f"Failed to register worker in Redis: {e}")
-
-async def unregister_worker():
-    try:
-        redis_conn = get_redis()
-        redis_conn.delete(f"worker:{WORKER_ID}")
-        print(f"Worker {WORKER_ID} unregistered from Redis")
-    except Exception as e:
-        print(f"Failed to unregister worker: {e}")
 
 @app.on_event("startup")
 async def startup_event():
-    os.makedirs(BASE_FOLDER, exist_ok=True)
-    os.makedirs(SESSIONS_FOLDER, exist_ok=True)
     asyncio.create_task(cleanup_inactive_sessions())
-    await register_worker()
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await unregister_worker()
-    for user_id, session_info in list(sessions.items()):
-        session_info.controller.cleanup()
-
-@app.get("/health")
-async def health_check():
-    return {
-        "worker_id": WORKER_ID,
-        "status": "online",
-        "sessions": len(sessions)
-    }
 
 async def get_session(user_id: str) -> SessionInfo:
     if user_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found. Please start a new session.")
-    
-    session_info = sessions[user_id]
-    session_info.last_activity = time.time()
-    
-    if not session_info.controller._kernel_ready:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    si = sessions[user_id]
+    si.last_activity = time.time()
+    if not si.controller._kernel_ready:
         try:
-            await session_info.controller._wait_for_kernel_ready(timeout=10)
+            await si.controller._wait_for_kernel_ready(timeout=10)
         except TimeoutError:
-            await session_info.controller.reset_kernel()
-    
-    return session_info
+            await si.controller.reset_kernel()
+    return si
+
 
 @app.post("/start_session")
 async def start_session(user_id: str = Form(...)):
-    redis_conn = get_redis()
-    
-    existing_worker = redis_conn.get(f"session:{user_id}")
-    if existing_worker and existing_worker != WORKER_ID:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Session for user {user_id} exists on {existing_worker}"
-        )
-    
+    # Check if user is pinned to this worker via Redis
+    if r:
+        pinned_worker = r.get(f"session:{user_id}")
+        if pinned_worker and pinned_worker != WORKER_ID:
+            raise HTTPException(status_code=409, detail=f"Session pinned to {pinned_worker}")
+
     if user_id in sessions:
         sessions[user_id].controller.cleanup()
-    
+
     session_folder = os.path.join(SESSIONS_FOLDER, user_id)
     controller = JupyterController(session_folder)
-    
     try:
         notebook_path = await controller.create_notebook(f"notebook_{user_id}")
         sessions[user_id] = SessionInfo(controller, time.time())
-        
+        # Pre-import common libraries
         setup_code = """
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import json, os, sys, math, re, itertools, collections
+from datetime import datetime, timedelta
+print("Environment ready.")
 """
         await controller.execute_code(setup_code)
-        
-        redis_conn.set(f"session:{user_id}", WORKER_ID, ex=3600)
-        
-        return {
-            "message": "Session started successfully",
-            "notebook_path": notebook_path
-        }
+        return {"message": "Session started successfully", "notebook_path": notebook_path, "worker_id": WORKER_ID}
     except Exception as e:
         controller.cleanup()
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/execute")
 async def execute_code(request: ExecuteRequest):
     session_info = await get_session(request.user_id)
-    
     try:
-        output = await session_info.controller.execute_code(request.code)
-        return {"output": output}
+        result = await session_info.controller.execute_code(request.code)
+        return result
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/install_package")
 async def install_package(request: InstallPackageRequest):
     session_info = await get_session(request.user_id)
-    
     try:
         result = subprocess.run(
             ["pip", "install", request.package_name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=300
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300
         )
-        
         if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to install {request.package_name}: {result.stderr}"
-            )
-        
-        import_code = f"import {request.package_name.split('[')[0]}"
-        await session_info.controller.execute_code(import_code)
-        
-        return {
-            "message": f"Successfully installed and imported {request.package_name}",
-            "output": result.stdout
-        }
+            raise HTTPException(status_code=500, detail=f"Failed to install {request.package_name}: {result.stderr}")
+        import_name = request.package_name.split('[')[0].split('==')[0].split('>=')[0]
+        await session_info.controller.execute_code(f"import {import_name}")
+        return {"message": f"Successfully installed and imported {request.package_name}", "output": result.stdout}
     except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Package installation timed out for {request.package_name}"
-        )
+        raise HTTPException(status_code=500, detail=f"Package installation timed out for {request.package_name}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/reset")
 async def reset_session(user_id: str = Form(...)):
     session_info = await get_session(user_id)
-    
     try:
         await session_info.controller.reset_kernel()
-        
         setup_code = """
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import json, os, sys, math, re, itertools, collections
+from datetime import datetime, timedelta
+print("Environment reset and ready.")
 """
         await session_info.controller.execute_code(setup_code)
-        
         return {"message": "Kernel reset successful"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/end_session")
 async def end_session(user_id: str = Form(...)):
     if user_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    session_info = sessions.pop(user_id)
-    session_info.controller.cleanup()
-    
-    try:
-        redis_conn = get_redis()
-        redis_conn.delete(f"session:{user_id}")
-    except Exception as e:
-        print(f"Failed to cleanup Redis session: {e}")
-    
+    sessions.pop(user_id).controller.cleanup()
     return {"message": "Session ended successfully"}
+
+
+@app.get("/session/{user_id}/history")
+async def get_session_history(user_id: str):
+    session_info = await get_session(user_id)
+    return {"history": session_info.controller.execution_history}
+
+
+@app.get("/session/{user_id}/export")
+async def export_notebook(user_id: str):
+    session_info = await get_session(user_id)
+    notebook_json = session_info.controller.export_notebook()
+    return {"notebook": notebook_json, "filename": f"session_{user_id}.ipynb"}
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "online",
+        "worker_id": WORKER_ID,
+        "active_sessions": len(sessions),
+        "version": "2.0.0",
+    }
+
+
+# ─── File Workspace Endpoints ────────────────────────────────────────────────
+
+WORKSPACE_FOLDER = "/mnt/data/workspace"
+ALLOWED_EXTENSIONS = {".csv", ".json", ".txt", ".parquet", ".xlsx", ".png", ".jpg", ".py", ".md"}
+MAX_FILE_SIZE_MB = 100
+
+
+@app.post("/workspace/upload_shard")
+async def upload_shard(file_shard: UploadFile, user_id: str = Form(...), filename: str = Form(...), shard_index: int = Form(...)):
+    user_workspace = os.path.join(WORKSPACE_FOLDER, user_id)
+    os.makedirs(user_workspace, exist_ok=True)
+    # Save the part file with its index mapping
+    dest_path = os.path.join(user_workspace, f"{filename}.part{shard_index}")
+    content = await file_shard.read()
+    with open(dest_path, "wb") as f:
+        f.write(content)
+    
+    # Write a tiny metadata file so `list_files` knows the original file exists in D-FS
+    meta_path = os.path.join(user_workspace, f"{filename}.meta")
+    with open(meta_path, "w") as f:
+        f.write(str(len(content)))
+        
+    return {"message": "Shard saved", "shard_index": shard_index}
+
+from fastapi.responses import Response
+
+@app.get("/workspace/download_shard/{filename}")
+async def download_shard(filename: str, user_id: str):
+    user_workspace = os.path.join(WORKSPACE_FOLDER, user_id)
+    # Give back whichever shard we have
+    for f in os.listdir(user_workspace):
+        if f.startswith(f"{filename}.part"):
+            shard_index = f.replace(f"{filename}.part", "")
+            fpath = os.path.join(user_workspace, f)
+            with open(fpath, "rb") as bf:
+                content = bf.read()
+            return Response(content=content, media_type="application/octet-stream", headers={"X-Shard-Index": shard_index})
+    raise HTTPException(status_code=404, detail="Shard not found on this node")
+
+
+@app.get("/workspace/files")
+async def list_files(user_id: str):
+    """List files in a user's workspace."""
+    user_workspace = os.path.join(WORKSPACE_FOLDER, user_id)
+    os.makedirs(user_workspace, exist_ok=True)
+
+    files = []
+    for fname in os.listdir(user_workspace):
+        fpath = os.path.join(user_workspace, fname)
+        if os.path.isfile(fpath):
+            stat = os.stat(fpath)
+            files.append({
+                "name": fname,
+                "size_bytes": stat.st_size,
+                "modified": stat.st_mtime,
+                "extension": os.path.splitext(fname)[1].lower(),
+                "workspace_path": f"/mnt/data/workspace/{user_id}/{fname}",
+            })
+    files.sort(key=lambda x: x["modified"], reverse=True)
+    return {"files": files, "user_id": user_id}
+
+
+@app.delete("/workspace/files/{filename}")
+async def delete_file(filename: str, user_id: str):
+    """Delete a file from user's workspace."""
+    safe_name = os.path.basename(filename)
+    fpath = os.path.join(WORKSPACE_FOLDER, user_id, safe_name)
+    if not os.path.exists(fpath):
+        raise HTTPException(status_code=404, detail="File not found")
+    os.remove(fpath)
+    return {"message": f"Deleted {safe_name}"}
+
+
+@app.get("/workspace/suggest/{filename}")
+async def suggest_analysis(filename: str, user_id: str):
+    """Get suggested analysis code for an uploaded file."""
+    ext = os.path.splitext(filename)[1].lower()
+    workspace_path = f"/mnt/data/workspace/{user_id}/{filename}"
+    suggestions = {
+        ".csv": f"""import pandas as pd
+df = pd.read_csv('{workspace_path}')
+print(f"Shape: {{df.shape}}")
+print(f"Columns: {{list(df.columns)}}")
+print("\\nFirst 5 rows:")
+print(df.head().to_string())
+print("\\nData types:")
+print(df.dtypes)
+print("\\nBasic stats:")
+print(df.describe())""",
+        ".json": f"""import json, pandas as pd
+with open('{workspace_path}') as f:
+    data = json.load(f)
+print(f"Type: {{type(data).__name__}}")
+if isinstance(data, list):
+    print(f"Records: {{len(data)}}")
+    df = pd.DataFrame(data)
+    print(df.head().to_string())
+else:
+    print(f"Keys: {{list(data.keys())}}")""",
+        ".parquet": f"""import pandas as pd
+df = pd.read_parquet('{workspace_path}')
+print(f"Shape: {{df.shape}}")
+print(df.head().to_string())
+print(df.dtypes)""",
+        ".xlsx": f"""import pandas as pd
+df = pd.read_excel('{workspace_path}')
+print(f"Shape: {{df.shape}}")
+print(df.head().to_string())""",
+        ".txt": f"""with open('{workspace_path}') as f:
+    content = f.read()
+print(f"Length: {{len(content)}} chars")
+print("First 500 chars:")
+print(content[:500])""",
+    }
+    code = suggestions.get(ext, f"# No template for {ext}\nprint('File at: {workspace_path}')")
+    return {"code": code, "filename": filename, "extension": ext}
+
+
+# ─── Locking Mechanism ──────────────────────────────────────────────────────
+
+@app.post("/lock")
+async def handle_lock(req: LockRequest):
+    if not r:
+        return {"status": "unsupported", "message": "Redis not available"}
+    
+    lock_key = "lock:code_editor"
+    if req.action == "acquire":
+        success = r.set(lock_key, req.user_id, nx=True, ex=30)
+        if success:
+            return {"status": "acquired", "user_id": req.user_id}
+        else:
+            current_owner = r.get(lock_key)
+            return {"status": "denied", "owner": current_owner}
+    else:
+        owner = r.get(lock_key)
+        if owner == req.user_id:
+            r.delete(lock_key)
+            return {"status": "released"}
+        return {"status": "not_owner", "owner": owner}
+
+# ─── AI Endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/ai/models")
+async def get_available_models():
+    providers = llm_client.get_available_providers()
+    models = []
+    for model_key, config in AVAILABLE_MODELS.items():
+        provider_available = any(p["provider"] == config.provider.value for p in providers)
+        models.append({
+            "key": model_key,
+            "display_name": config.display_name,
+            "provider": config.provider.value,
+            "model_id": config.model_id,
+            "max_tokens": config.max_tokens,
+            "available": provider_available,
+        })
+    return {"models": models, "providers": providers}
+
+@app.post("/ai/generate")
+async def ai_generate_code(request: AIGenerateRequest):
+    response = await llm_client.generate(
+        prompt=request.prompt,
+        model_key=request.model or "llama-3.3-70b",
+        system_prompt=CODE_GENERATION_SYSTEM_PROMPT,
+        context=request.context,
+    )
+    if response.error:
+        raise HTTPException(status_code=500, detail=f"LLM error: {response.error}")
+    
+    code = response.content.strip()
+    for fence in ["```python", "```py", "```"]:
+        if code.startswith(fence):
+            code = code[len(fence):]
+    if code.endswith("```"):
+        code = code[:-3]
+    
+    return {
+        "code": code.strip(),
+        "model": response.model,
+        "provider": response.provider,
+        "latency_ms": round(response.latency_ms or 0, 1),
+    }
+
+@app.post("/ai/swarm/run")
+async def run_autonomous_swarm(req: SwarmRequest, background_tasks: BackgroundTasks):
+    job_id = f"swarm-{uuid.uuid4()}"
+    
+    async def swarm_callback(role, message, metadata=None, status="running"):
+        await manager.broadcast(job_id, {"type": "swarm_event", "role": role, "message": message, "metadata": metadata, "status": status})
+
+    async def session_runner(code: str):
+        # Ensure session exists
+        if req.user_id not in sessions:
+            await start_session(req.user_id)
+        si = await get_session(req.user_id)
+        return await si.controller.execute_code(code)
+
+    async def bg_swarm():
+        await manager.broadcast(job_id, {"type": "status", "status": "running"})
+        result = await execute_autonomous_swarm(req, session_runner, swarm_callback)
+        await manager.broadcast(job_id, {
+            "type": "swarm_complete",
+            "status": result["status"],
+            "final_code": result.get("final_code"),
+            "final_output": result.get("final_output")
+        })
+
+    background_tasks.add_task(bg_swarm)
+    return {"job_id": job_id, "status": "running"}
+
+@app.websocket("/ws/job/{job_id}")
+async def websocket_job_updates(websocket: WebSocket, job_id: str):
+    await manager.connect(job_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect(job_id, websocket)
+
+@app.post("/ai/explain-error")
+async def ai_explain_error(request: AIExplainErrorRequest):
+    prompt = f"Code:\n{request.code}\nError:\n{request.error}\nExplain and fix."
+    response = await llm_client.generate(
+        prompt=prompt,
+        model_key=request.model or "llama-3.3-70b",
+        system_prompt=ERROR_EXPLANATION_SYSTEM_PROMPT,
+    )
+    if response.error: raise HTTPException(status_code=500, detail=response.error)
+    try:
+        import re
+        json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+        explanation = json.loads(json_match.group()) if json_match else {"explanation": response.content}
+    except Exception: explanation = {"explanation": response.content}
+    return {"explanation": explanation, "provider": response.provider, "latency_ms": response.latency_ms}
+
+@app.post("/ai/review")
+async def ai_review_code(request: AIReviewRequest):
+    response = await llm_client.generate(prompt=request.code, model_key=request.model, system_prompt=CODE_REVIEW_SYSTEM_PROMPT)
+    if response.error: raise HTTPException(status_code=500, detail=response.error)
+    try:
+        import re
+        json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+        review = json.loads(json_match.group()) if json_match else {"summary": response.content}
+    except Exception: review = {"summary": response.content}
+    return {"review": review, "provider": response.provider, "latency_ms": response.latency_ms}
+
+
+# ─── Services Deployment ─────────────────────────────────────────────────────
+
+import subprocess
+
+class StartServiceRequest(BaseModel):
+    service_id: str
+    user_id: str
+    code: str
+    port: Optional[int] = 8000
+
+active_services = {}
+
+@app.post("/services/start")
+async def start_service(req: StartServiceRequest):
+    if req.service_id in active_services:
+        raise HTTPException(status_code=400, detail="Service ID already running")
+
+    # Enforce 1 service per worker to avoid port conflict simply.
+    if active_services:
+        raise HTTPException(status_code=409, detail="Worker already has an active service. Please queue.")
+
+    service_dir = f"/mnt/data/services/{req.user_id}/{req.service_id}"
+    os.makedirs(service_dir, exist_ok=True)
+    file_path = os.path.join(service_dir, "app.py")
+    with open(file_path, "w") as f:
+        f.write(req.code)
+
+    try:
+        process = subprocess.Popen(
+            ["python", "app.py"],
+            cwd=service_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        active_services[req.service_id] = {
+            "process": process,
+            "port": req.port,
+            "dir": service_dir,
+            "user_id": req.user_id
+        }
+        return {"status": "started", "service_id": req.service_id, "port": req.port}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/services/stop/{service_id}")
+async def stop_service(service_id: str):
+    if service_id not in active_services:
+        raise HTTPException(status_code=404, detail="Service not found")
+        
+    process = active_services[service_id]["process"]
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        
+    del active_services[service_id]
+    return {"status": "stopped", "service_id": service_id}

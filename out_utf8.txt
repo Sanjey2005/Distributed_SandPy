@@ -1,0 +1,80 @@
+﻿job-farm-worker1  | INFO:     Started server process [1]
+job-farm-worker1  | INFO:     Waiting for application startup.
+job-farm-worker1  | INFO:     Application startup complete.
+job-farm-worker1  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+job-farm-worker1  | INFO:     172.19.0.1:48520 - "POST /ai/swarm/run HTTP/1.1" 200 OK
+job-farm-worker1  | INFO:     172.19.0.1:47184 - "GET /ws/job/test HTTP/1.1" 404 Not Found
+job-farm-worker1  | INFO:     172.19.0.1:51416 - "POST /execute HTTP/1.1" 404 Not Found
+job-farm-worker1  | INFO:     172.19.0.1:36150 - "POST /start_session HTTP/1.1" 200 OK
+job-farm-worker3  | INFO:     Started server process [1]
+job-farm-worker3  | INFO:     Waiting for application startup.
+job-farm-worker3  | INFO:     Application startup complete.
+job-farm-worker1  | INFO:     172.19.0.1:38910 - "POST /execute HTTP/1.1" 200 OK
+job-farm-worker3  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+job-farm-worker1  | INFO:     172.19.0.1:47430 - "WebSocket /ws/job/test" [accepted]
+job-farm-worker3  | INFO:     Shutting down
+job-farm-worker3  | INFO:     Waiting for application shutdown.
+job-farm-worker3  | INFO:     Application shutdown complete.
+job-farm-worker3  | INFO:     Finished server process [1]
+job-farm-worker3  | INFO:     Started server process [1]
+job-farm-worker3  | INFO:     Waiting for application startup.
+job-farm-worker3  | INFO:     Application startup complete.
+job-farm-worker1  | INFO:     connection open
+job-farm-worker1  | INFO:     connection closed
+job-farm-worker1  | INFO:     Shutting down
+job-farm-worker1  | INFO:     Waiting for application shutdown.
+job-farm-worker1  | INFO:     Application shutdown complete.
+job-farm-worker1  | INFO:     Finished server process [1]
+job-farm-worker1  | INFO:     Started server process [1]
+job-farm-worker1  | INFO:     Waiting for application startup.
+job-farm-worker1  | INFO:     Application startup complete.
+job-farm-worker1  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+job-farm-worker1  | INFO:     172.19.0.1:43700 - "OPTIONS /ai/swarm/run HTTP/1.1" 200 OK
+job-farm-worker1  | INFO:     172.19.0.1:43700 - "POST /ai/swarm/run HTTP/1.1" 200 OK
+job-farm-worker1  | INFO:     172.19.0.1:43708 - "WebSocket /ws/job/swarm-9294bd66-e9f6-4164-b925-caf7e74c34e9" [accepted]
+job-farm-worker1  | INFO:     connection open
+job-farm-worker1  | Primary model llama-3.3-70b failed: Client error '429 Too Many Requests' for url 'https://api.groq.com/openai/v1/chat/completions'
+job-farm-worker1  | For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
+job-farm-worker1  | Fallback gemini-2.0-flash failed: Client error '429 Too Many Requests' for url 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=AIzaSyDrcQ33Gm7NMO0AOSeEowHhut2qMhvSsHQ'
+job-farm-worker3  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+job-farm-worker3  | INFO:     Shutting down
+job-farm-worker3  | INFO:     Waiting for application shutdown.
+job-farm-worker3  | INFO:     Application shutdown complete.
+job-farm-worker1  | For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
+job-farm-worker1  | INFO:     Shutting down
+job-farm-worker1  | INFO:     connection closed
+job-farm-worker3  | INFO:     Finished server process [1]
+job-farm-worker3  | INFO:     Started server process [1]
+job-farm-worker3  | INFO:     Waiting for application startup.
+job-farm-worker3  | INFO:     Application startup complete.
+job-farm-worker3  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+job-farm-worker1  | INFO:     Waiting for application shutdown.
+job-farm-worker1  | INFO:     Application shutdown complete.
+job-farm-worker1  | INFO:     Finished server process [1]
+job-farm-worker1  | INFO:     Started server process [1]
+job-farm-worker1  | INFO:     Waiting for application startup.
+job-farm-worker1  | INFO:     Application startup complete.
+job-farm-worker1  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+job-farm-worker1  | INFO:     172.19.0.1:51032 - "POST /ai/swarm/run HTTP/1.1" 200 OK
+job-farm-worker1  | INFO:     172.19.0.1:51046 - "WebSocket /ws/job/swarm-4800e154-b5d1-4d5d-a2d7-0f084a34e2ad" [accepted]
+job-farm-worker1  | INFO:     connection open
+job-farm-worker2  | INFO:     Started server process [1]
+job-farm-worker2  | INFO:     Waiting for application startup.
+job-farm-worker2  | INFO:     Application startup complete.
+job-farm-worker2  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+job-farm-worker2  | INFO:     Shutting down
+job-farm-worker2  | INFO:     Waiting for application shutdown.
+job-farm-worker2  | INFO:     Application shutdown complete.
+job-farm-worker2  | INFO:     Finished server process [1]
+job-farm-worker2  | INFO:     Started server process [1]
+job-farm-worker2  | INFO:     Waiting for application startup.
+job-farm-worker2  | INFO:     Application startup complete.
+job-farm-worker2  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+job-farm-worker2  | INFO:     Shutting down
+job-farm-worker2  | INFO:     Waiting for application shutdown.
+job-farm-worker2  | INFO:     Application shutdown complete.
+job-farm-worker2  | INFO:     Finished server process [1]
+job-farm-worker2  | INFO:     Started server process [1]
+job-farm-worker2  | INFO:     Waiting for application startup.
+job-farm-worker2  | INFO:     Application startup complete.
+job-farm-worker2  | INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
