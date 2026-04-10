@@ -15,9 +15,9 @@ import {
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 
 const WORKERS = [
-  { id: "worker1", url: "http://localhost:5002", display: "Core A-1" },
-  { id: "worker2", url: "http://localhost:5003", display: "Core B-2" },
-  { id: "worker3", url: "http://localhost:5004", display: "Core C-3" },
+  { id: "worker1", url: "http://localhost:5002", display: "Core A-1", appPort: 8001 },
+  { id: "worker2", url: "http://localhost:5003", display: "Core B-2", appPort: 8002 },
+  { id: "worker3", url: "http://localhost:5004", display: "Core C-3", appPort: 8003 },
 ];
 
 const AGENTS = [
@@ -30,8 +30,8 @@ const AGENTS = [
 const MODELS = [
   { id: "gpt-4o-mini", name: "GPT-4o Mini", provider: "OpenAI" },
   { id: "gpt-4o", name: "GPT-4o", provider: "OpenAI" },
-  { id: "claude-3-5-sonnet", name: "Claude 3.5 Sonnet", provider: "Anthropic" },
   { id: "llama-3.3-70b", name: "Llama 3.3 70B", provider: "Groq" },
+  { id: "llama-3.1-8b", name: "Llama 3.1 8B", provider: "Groq" },
   { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash", provider: "Google" },
   { id: "mixtral-8x7b", name: "Mixtral 8x7B", provider: "Groq" },
 ];
@@ -118,11 +118,15 @@ export function DashboardClient() {
   useEffect(() => {
     let iv: any;
     if (tab === "services" && user) {
-      const fetchSvc = () => {
-        fetch("http://localhost:5002/services?user_id=" + user.user_id)
-        .then(r => r.json())
-        .then(d => setServicesList(d.services || []))
-        .catch(() => {});
+      const fetchSvc = async () => {
+        const results = await Promise.allSettled(
+          WORKERS.map(w =>
+            fetch(`${w.url}/services?user_id=${user.user_id}`)
+              .then(r => r.json())
+              .then((d: any) => (d.services || []).map((s: any) => ({ ...s, appPort: w.appPort })))
+          )
+        );
+        setServicesList(results.flatMap(r => r.status === "fulfilled" ? r.value : []));
       };
       fetchSvc();
       iv = setInterval(fetchSvc, 2000);
@@ -133,16 +137,25 @@ export function DashboardClient() {
   const deployCode = async () => {
     setIsSubmitting(true);
     try {
-      await fetch("http://localhost:5002/services/start", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: user?.user_id, code })
-      });
+      const service_id = crypto.randomUUID();
+      for (const worker of WORKERS) {
+        try {
+          const resp = await fetch(`${worker.url}/services/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ service_id, user_id: user?.user_id, code, port: 8000 }),
+          });
+          if (resp.ok) break;
+        } catch { /* worker unreachable, try next */ }
+      }
       setTab("services");
     } finally { setIsSubmitting(false); }
   };
   
-  const stopService = async (service_id: string) => {
-    await fetch("http://localhost:5002/services/stop/" + service_id, { method: "DELETE" });
+  const stopService = async (service_id: string, worker_id: string) => {
+    const worker = WORKERS.find(w => w.id === worker_id);
+    const url = worker ? worker.url : activeWorker.url;
+    await fetch(`${url}/services/stop/${service_id}`, { method: "DELETE" });
   };
   const [prompt, setPrompt] = useState("");
 
@@ -228,10 +241,10 @@ export function DashboardClient() {
   };
 
   return (
-    <div className="h-screen w-screen bg-[#010103] text-zinc-300 flex flex-col overflow-hidden font-sans selection:bg-cyan-500/30">
+    <div className="w-full max-w-[1600px] mx-auto h-[900px] rounded-3xl border border-white/10 shadow-2xl relative bg-[#010103] text-zinc-300 flex flex-col overflow-hidden font-sans selection:bg-cyan-500/30">
       {/* Dynamic BG */}
-      <div className="fixed inset-0 pointer-events-none opacity-[0.05]" style={{ backgroundImage: "radial-gradient(#ffffff 1px, transparent 1px)", backgroundSize: "32px 32px" }} />
-      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[120vw] h-[120vh] bg-[radial-gradient(circle_at_center,rgba(6,182,212,0.05)_0%,transparent_70%)] pointer-events-none -z-10" />
+      <div className="absolute inset-0 pointer-events-none opacity-[0.05]" style={{ backgroundImage: "radial-gradient(#ffffff 1px, transparent 1px)", backgroundSize: "32px 32px" }} />
+      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[120vw] h-[120vh] bg-[radial-gradient(circle_at_center,rgba(6,182,212,0.05)_0%,transparent_70%)] pointer-events-none -z-10" />
 
       {/* Header - Slim & HighTech */}
       <header className="h-16 flex items-center justify-between px-8 border-b border-white/5 bg-black/50 backdrop-blur-xl z-50">
@@ -274,7 +287,7 @@ export function DashboardClient() {
       <main className="flex-1 grid grid-cols-12 overflow-hidden">
 
         {/* Left Column - Core Interface */}
-        <div className="col-span-8 flex flex-col border-r border-white/5 bg-[#030307]">
+        <div className="col-span-8 flex flex-col border-r border-white/5 bg-[#030307] min-h-0 overflow-hidden">
 
           {/* Agent Visual Pipeline */}
           <div className="px-8 pt-8 pb-4">
@@ -282,8 +295,8 @@ export function DashboardClient() {
           </div>
 
           {/* Monaco Area */}
-          <div className="flex-1 relative group px-8 pb-8">
-            <Card3D className="h-full bg-black/60 rounded-3xl border border-white/5 overflow-hidden flex flex-col relative shadow-2xl">
+          <div className="flex-1 flex flex-col px-8 pb-4 min-h-0">
+            <Card3D className="flex-1 min-h-0 bg-black/60 rounded-3xl border border-white/5 overflow-hidden flex flex-col relative shadow-2xl">
               <div className="absolute top-4 right-4 z-50 flex gap-2">
                 {activeAgent && (
                   <motion.div animate={{ scale: [1, 1.1, 1] }} transition={{ repeat: Infinity }} className="px-3 py-1 bg-cyan-500/20 border border-cyan-500/40 rounded-full flex items-center gap-2">
@@ -299,24 +312,24 @@ export function DashboardClient() {
                   options={{ minimap: { enabled: false }, fontSize: 13, smoothScrolling: true, padding: { top: 20 }, cursorBlinking: "smooth" }}
                 />
               </div>
-              <div className="p-1 px-4 bg-black/60 border-t border-white/5 flex items-center justify-between">
-                <div className="flex gap-4">
-                  <button onClick={executeCode} disabled={isSubmitting} className="h-10 px-6 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-black uppercase tracking-widest transition flex items-center gap-2 group shadow-lg shadow-cyan-900/20 active:scale-95">
-                    <Power className="w-4 h-4 group-hover:rotate-90 transition-transform" /> Execute Main
-                  </button>
-                  <button onClick={deployCode} disabled={isSubmitting} className="h-10 px-6 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-black uppercase tracking-widest transition flex items-center gap-2 group shadow-lg shadow-purple-900/20 active:scale-95">
-                    <Globe className="w-4 h-4 group-hover:-translate-y-1 transition-transform" /> Auto Deploy
-                  </button>
-                  <button className="h-10 px-4 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-zinc-400 transition flex items-center gap-2"><History className="w-4 h-4" /> 0x42F</button>
-                </div>
-                <div className="text-[10px] font-black uppercase text-zinc-600 tracking-wider">Kernal Status: Idle | Latency: 12ms</div>
-              </div>
             </Card3D>
+            <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 bg-black/60 border border-white/5 rounded-2xl mt-3">
+              <div className="flex gap-4">
+                <button onClick={executeCode} disabled={isSubmitting} className="h-10 px-6 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-black uppercase tracking-widest transition flex items-center gap-2 group shadow-lg shadow-cyan-900/20 active:scale-95">
+                  <Power className="w-4 h-4 group-hover:rotate-90 transition-transform" /> Execute Main
+                </button>
+                <button onClick={deployCode} disabled={isSubmitting} className="h-10 px-6 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-black uppercase tracking-widest transition flex items-center gap-2 group shadow-lg shadow-purple-900/20 active:scale-95">
+                  <Globe className="w-4 h-4 group-hover:-translate-y-1 transition-transform" /> Auto Deploy
+                </button>
+                <button className="h-10 px-4 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-zinc-400 transition flex items-center gap-2"><History className="w-4 h-4" /> 0x42F</button>
+              </div>
+              <div className="text-[10px] font-black uppercase text-zinc-600 tracking-wider">Kernal Status: Idle | Latency: 12ms</div>
+            </div>
           </div>
         </div>
 
         {/* Right Column - Controls & Feedback */}
-        <div className="col-span-4 flex flex-col bg-black/20">
+        <div className="col-span-4 flex flex-col bg-black/20 min-h-0 overflow-hidden">
 
           {/* Swarm Command Module */}
           <div className="p-8 border-b border-white/5">
@@ -416,8 +429,11 @@ export function DashboardClient() {
                             </span>
                             <span className="text-[10px] text-zinc-500 font-mono mt-2 flex items-center gap-2"><div className="w-1 h-1 bg-zinc-600 rounded-full"/> ID: {svc.service_id.slice(0,8)}</span>
                             <span className="text-[10px] text-zinc-500 font-mono mt-1 flex items-center gap-2"><div className="w-1 h-1 bg-zinc-600 rounded-full"/> Worker: <span className="text-cyan-400 ml-1">{svc.worker_id}</span></span>
+                            <a href={`http://localhost:${svc.appPort}`} target="_blank" rel="noreferrer" className="text-[10px] text-cyan-400 font-mono mt-1 flex items-center gap-2 hover:underline">
+                              <Globe className="w-3 h-3" /> localhost:{svc.appPort}
+                            </a>
                          </div>
-                         <button onClick={() => stopService(svc.service_id)} className="h-10 px-5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 border border-red-500/20 text-[10px] font-black uppercase transition shrink-0 tracking-widest flex items-center gap-2">
+                         <button onClick={() => stopService(svc.service_id, svc.worker_id)} className="h-10 px-5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 border border-red-500/20 text-[10px] font-black uppercase transition shrink-0 tracking-widest flex items-center gap-2">
                            <Power className="w-3 h-3"/> Stop Process
                          </button>
                       </div>

@@ -8,6 +8,9 @@ import sys
 import time
 import json
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 import queue
 import redis
 import subprocess
@@ -22,8 +25,8 @@ from ai_swarm import SwarmRequest, execute_autonomous_swarm
 
 app = FastAPI(title="SandPy Worker", version="2.0.0")
 
-BASE_FOLDER = "/mnt/data"
-SESSIONS_FOLDER = "/mnt/jupyter_sessions"
+BASE_FOLDER = os.environ.get("BASE_FOLDER", os.path.join(os.getcwd(), "data"))
+SESSIONS_FOLDER = os.environ.get("SESSIONS_FOLDER", os.path.join(os.getcwd(), "jupyter_sessions"))
 WORKER_ID = os.getenv("WORKER_ID", "worker1")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
@@ -45,16 +48,24 @@ app.add_middleware(
 class ConnectionManager:
     def __init__(self):
         self.active: Dict[str, List[WebSocket]] = {}
+        self.buffer: Dict[str, List[dict]] = {}
 
     async def connect(self, job_id: str, ws: WebSocket):
         await ws.accept()
         self.active.setdefault(job_id, []).append(ws)
+        # Replay any events that fired before the WebSocket connected
+        for message in self.buffer.get(job_id, []):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                break
 
     def disconnect(self, job_id: str, ws: WebSocket):
         if job_id in self.active:
             self.active[job_id] = [w for w in self.active[job_id] if w != ws]
 
     async def broadcast(self, job_id: str, message: dict):
+        self.buffer.setdefault(job_id, []).append(message)
         if job_id in self.active:
             dead = []
             for ws in self.active[job_id]:
@@ -120,7 +131,7 @@ class JupyterController:
             except queue.Empty:
                 break
 
-    async def execute_code(self, code: str) -> Dict:
+    async def execute_code(self, code: str, raise_http: bool = True) -> Dict:
         """Execute code and capture ALL output types: text, images, HTML, Plotly."""
         if not self._kernel_ready:
             raise RuntimeError("Kernel not ready. Please wait or restart session.")
@@ -128,8 +139,8 @@ class JupyterController:
             self._kernel_ready = False
             raise RuntimeError("Kernel died. Please restart session.")
 
-        self._clear_output_queue()
-        
+        await asyncio.to_thread(self._clear_output_queue)
+
         # Inject matplotlib backend for non-interactive PNG capture
         setup_code = """
 import matplotlib
@@ -187,7 +198,7 @@ if _captured_images:
         
         while True:
             try:
-                msg = self.kernel_client.get_iopub_msg(timeout=120)
+                msg = await asyncio.to_thread(self.kernel_client.get_iopub_msg, timeout=10)
                 parent_msg_id = msg.get('parent_header', {}).get('msg_id')
                 if parent_msg_id and parent_msg_id != msg_id:
                     continue  # Ignore delayed messages from previous executions
@@ -233,16 +244,25 @@ if _captured_images:
                         text_outputs.append(str(data['text/plain']))
                 
                 elif msg_type == 'error':
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error": "Execution error", "traceback": content['traceback']}
-                    )
+                    if raise_http:
+                        raise HTTPException(
+                            status_code=400,
+                            detail={"error": "Execution error", "traceback": content['traceback']}
+                        )
+                    else:
+                        tb = '\n'.join(content.get('traceback', []))
+                        error_text = f"Error: {content.get('ename', 'Unknown')}: {content.get('evalue', '')}\n{tb}"
+                        text_outputs.append(error_text)
                 
                 elif msg_type == 'status' and content['execution_state'] == 'idle':
                     break
 
             except queue.Empty:
-                raise HTTPException(status_code=408, detail="Code execution timed out")
+                if raise_http:
+                    raise HTTPException(status_code=408, detail="Code execution timed out")
+                else:
+                    text_outputs.append("Error: Code execution timed out (no response from kernel)")
+                    break
 
         output_text = '\n'.join(text_outputs) if text_outputs else ""
         
@@ -266,7 +286,7 @@ if _captured_images:
             self._kernel_ready = False
             self.kernel_manager.restart_kernel()
             await self._wait_for_kernel_ready()
-            self._clear_output_queue()
+            await asyncio.to_thread(self._clear_output_queue)
             self.execution_history = []
 
     def cleanup(self):
@@ -474,7 +494,7 @@ async def health_check():
 
 # ─── File Workspace Endpoints ────────────────────────────────────────────────
 
-WORKSPACE_FOLDER = "/mnt/data/workspace"
+WORKSPACE_FOLDER = os.path.join(BASE_FOLDER, "workspace")
 ALLOWED_EXTENSIONS = {".csv", ".json", ".txt", ".parquet", ".xlsx", ".png", ".jpg", ".py", ".md"}
 MAX_FILE_SIZE_MB = 100
 
@@ -528,7 +548,7 @@ async def list_files(user_id: str):
                 "size_bytes": stat.st_size,
                 "modified": stat.st_mtime,
                 "extension": os.path.splitext(fname)[1].lower(),
-                "workspace_path": f"/mnt/data/workspace/{user_id}/{fname}",
+                "workspace_path": os.path.join(WORKSPACE_FOLDER, user_id, fname),
             })
     files.sort(key=lambda x: x["modified"], reverse=True)
     return {"files": files, "user_id": user_id}
@@ -549,7 +569,7 @@ async def delete_file(filename: str, user_id: str):
 async def suggest_analysis(filename: str, user_id: str):
     """Get suggested analysis code for an uploaded file."""
     ext = os.path.splitext(filename)[1].lower()
-    workspace_path = f"/mnt/data/workspace/{user_id}/{filename}"
+    workspace_path = os.path.join(WORKSPACE_FOLDER, user_id, filename)
     suggestions = {
         ".csv": f"""import pandas as pd
 df = pd.read_csv('{workspace_path}')
@@ -667,17 +687,26 @@ async def run_autonomous_swarm(req: SwarmRequest, background_tasks: BackgroundTa
         if req.user_id not in sessions:
             await start_session(req.user_id)
         si = await get_session(req.user_id)
-        return await si.controller.execute_code(code)
+        return await si.controller.execute_code(code, raise_http=False)
 
     async def bg_swarm():
-        await manager.broadcast(job_id, {"type": "status", "status": "running"})
-        result = await execute_autonomous_swarm(req, session_runner, swarm_callback)
-        await manager.broadcast(job_id, {
-            "type": "swarm_complete",
-            "status": result["status"],
-            "final_code": result.get("final_code"),
-            "final_output": result.get("final_output")
-        })
+        try:
+            await manager.broadcast(job_id, {"type": "status", "status": "running"})
+            result = await execute_autonomous_swarm(req, session_runner, swarm_callback)
+            await manager.broadcast(job_id, {
+                "type": "swarm_complete",
+                "status": result["status"],
+                "final_code": result.get("final_code"),
+                "final_output": result.get("final_output")
+            })
+        except Exception as e:
+            logger.exception(f"Swarm {job_id} crashed: {e}")
+            await manager.broadcast(job_id, {
+                "type": "swarm_complete",
+                "status": "failed",
+                "final_code": None,
+                "final_output": str(e)
+            })
 
     background_tasks.add_task(bg_swarm)
     return {"job_id": job_id, "status": "running"}
@@ -733,6 +762,69 @@ class StartServiceRequest(BaseModel):
 
 active_services = {}
 
+
+def _code_has_server(code: str) -> bool:
+    """Check if code already contains a real web server by looking for import statements."""
+    import re
+    # Only match actual import lines, not random keyword mentions like app.run()
+    patterns = [
+        r'^\s*from\s+flask\s+import',
+        r'^\s*import\s+flask',
+        r'^\s*from\s+fastapi\s+import',
+        r'^\s*import\s+fastapi',
+        r'^\s*from\s+http\.server\s+import',
+        r'^\s*import\s+http\.server',
+        r'^\s*from\s+bottle\s+import',
+        r'^\s*import\s+bottle',
+    ]
+    for line in code.splitlines():
+        for pat in patterns:
+            if re.match(pat, line, re.IGNORECASE):
+                return True
+    return False
+
+
+def wrap_code_with_server(code: str, port: int) -> str:
+    """If code doesn't already contain a web server, wrap it in one that serves stdout as HTML."""
+    if _code_has_server(code):
+        return code
+
+    indented = "\n".join("    " + line for line in code.splitlines())
+    return f'''import sys, io
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+_buf = io.StringIO()
+_old_stdout = sys.stdout
+sys.stdout = _buf
+try:
+{indented}
+except Exception as _e:
+    print(f"Error: {{_e}}")
+sys.stdout = _old_stdout
+_output = _buf.getvalue()
+
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        html = (
+            "<!DOCTYPE html><html><head><title>SandPy App</title>"
+            "<style>body{{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem;}}"
+            "pre{{background:#111;padding:1rem;border-radius:8px;border:1px solid #333;white-space:pre-wrap;}}</style>"
+            "</head><body><h2>SandPy Deployment Output</h2><pre>"
+            + _output.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            + "</pre></body></html>"
+        )
+        self.wfile.write(html.encode())
+    def log_message(self, *args):
+        pass
+
+print(f"Serving on 0.0.0.0:{port}")
+HTTPServer(("0.0.0.0", {port}), _Handler).serve_forever()
+'''
+
+
 @app.post("/services/start")
 async def start_service(req: StartServiceRequest):
     if req.service_id in active_services:
@@ -742,27 +834,43 @@ async def start_service(req: StartServiceRequest):
     if active_services:
         raise HTTPException(status_code=409, detail="Worker already has an active service. Please queue.")
 
-    service_dir = f"/mnt/data/services/{req.user_id}/{req.service_id}"
+    deploy_code = wrap_code_with_server(req.code, req.port)
+
+    service_dir = os.path.join(BASE_FOLDER, "services", req.user_id, req.service_id)
     os.makedirs(service_dir, exist_ok=True)
     file_path = os.path.join(service_dir, "app.py")
     with open(file_path, "w") as f:
-        f.write(req.code)
+        f.write(deploy_code)
 
+    log_path = os.path.join(service_dir, "output.log")
     try:
+        log_file = open(log_path, "w")
         process = subprocess.Popen(
             ["python", "app.py"],
             cwd=service_dir,
-            stdout=subprocess.PIPE,
+            stdout=log_file,
             stderr=subprocess.STDOUT,
-            text=True
         )
+
+        # Brief check — give the process a moment to crash on import/syntax errors
+        import time
+        time.sleep(0.5)
+        if process.poll() is not None:
+            log_file.close()
+            with open(log_path) as f:
+                error_output = f.read()
+            raise HTTPException(status_code=500, detail=f"Service crashed on startup: {error_output[:500]}")
+
         active_services[req.service_id] = {
             "process": process,
             "port": req.port,
             "dir": service_dir,
-            "user_id": req.user_id
+            "user_id": req.user_id,
+            "log_file": log_file,
         }
         return {"status": "started", "service_id": req.service_id, "port": req.port}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -771,12 +879,30 @@ async def stop_service(service_id: str):
     if service_id not in active_services:
         raise HTTPException(status_code=404, detail="Service not found")
         
-    process = active_services[service_id]["process"]
-    process.terminate()
+    svc = active_services[service_id]
+    svc["process"].terminate()
     try:
-        process.wait(timeout=5)
+        svc["process"].wait(timeout=5)
     except subprocess.TimeoutExpired:
-        process.kill()
-        
+        svc["process"].kill()
+    if "log_file" in svc:
+        try:
+            svc["log_file"].close()
+        except Exception:
+            pass
     del active_services[service_id]
     return {"status": "stopped", "service_id": service_id}
+
+@app.get("/services")
+async def list_services_on_worker(user_id: Optional[str] = None):
+    result = []
+    for sid, svc in active_services.items():
+        if not user_id or svc["user_id"] == user_id:
+            result.append({
+                "service_id": sid,
+                "port": svc["port"],
+                "worker_id": WORKER_ID,
+                "user_id": svc["user_id"],
+                "status": "running" if svc["process"].poll() is None else "stopped",
+            })
+    return {"services": result}

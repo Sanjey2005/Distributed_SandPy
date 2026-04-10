@@ -53,6 +53,11 @@ def extract_code(resp_content: str) -> str:
     return code.strip()
 
 
+def _is_simple_prompt(prompt: str) -> bool:
+    """Return True for short, straightforward prompts that don't need a planning step."""
+    return len(prompt.strip().split()) <= 15
+
+
 async def pick_healthy_worker() -> Optional[str]:
     """Return the URL of the first healthy, available worker, or None."""
     async with httpx.AsyncClient(timeout=5.0) as client:
@@ -121,20 +126,25 @@ async def execute_autonomous_swarm(req: SwarmRequest, websocket_callback=None):
         history.append({"role": role, "message": message, "metadata": metadata, "status": status})
 
     current_code = ""
+    is_simple = _is_simple_prompt(req.prompt)
 
     try:
         # ── STEP 1: PLANNER ──────────────────────────────────────────────────
-        log_event("planner", f"Analyzing prompt: '{req.prompt}'")
-        plan_resp = await asyncio.wait_for(
-            llm_client.generate(
-                f"Analyze this request and give a concise step-by-step plan: {req.prompt}",
-                req.model,
-                system_prompt="You are a senior AI systems architect. Be concise.",
-            ),
-            timeout=LLM_TIMEOUT
-        )
-        plan = plan_resp.content or "No plan generated."
-        log_event("planner", "Execution strategy ready.", {"content": plan}, status="completed")
+        if is_simple:
+            plan = "Direct generation"
+            log_event("planner", "Simple prompt — skipping planning.", status="completed")
+        else:
+            log_event("planner", f"Analyzing prompt: '{req.prompt}'")
+            plan_resp = await asyncio.wait_for(
+                llm_client.generate(
+                    f"Analyze this request and give a concise step-by-step plan: {req.prompt}",
+                    req.model,
+                    system_prompt="You are a senior AI systems architect. Be concise.",
+                ),
+                timeout=LLM_TIMEOUT
+            )
+            plan = plan_resp.content or "No plan generated."
+            log_event("planner", "Execution strategy ready.", {"content": plan}, status="completed")
 
         # ── STEP 2: CODER / SYNTHESIZER ──────────────────────────────────────
         log_event("coder", "Synthesizing Python code...")
@@ -145,9 +155,13 @@ async def execute_autonomous_swarm(req: SwarmRequest, websocket_callback=None):
             "Use print() to show results. "
             "If a web server is needed, bind to 0.0.0.0:8000."
         )
+        coder_prompt = (
+            f"Write Python code for: {req.prompt}" if is_simple
+            else f"User Prompt: {req.prompt}\nPlan: {plan}\nWrite the complete Python code."
+        )
         code_resp = await asyncio.wait_for(
             llm_client.generate(
-                f"User Prompt: {req.prompt}\nPlan: {plan}\nWrite the complete Python code.",
+                coder_prompt,
                 req.model,
                 system_prompt=coder_sys,
             ),

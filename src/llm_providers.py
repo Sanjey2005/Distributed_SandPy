@@ -74,7 +74,7 @@ Rules:
 2. The code runs in a Jupyter kernel where pandas, numpy, matplotlib are pre-imported
 3. Use print() statements to display results
 8. NEVER use `input()` or write interactive CLI terminal apps. NEVER use Desktop GUI libraries like `tkinter`, `PyQt`, `turtle`, or `pygame` as there is no display attached.
-9. If any "App" is requested, you MUST write a Web App (using FastAPI, Flask, or http.server) bound to 0.0.0.0:8000 so the user can see it in their browser. Set `allow_reuse_address = True`.
+9. If any "App" is requested, you MUST write a Web App using FastAPI with uvicorn (NOT Flask — it is not installed) bound to 0.0.0.0:8000. Set `allow_reuse_address = True`.
 """
 
 ERROR_EXPLANATION_SYSTEM_PROMPT = """You are an expert Python debugger and teacher.
@@ -128,6 +128,23 @@ class LLMClient:
         available.append({"provider": "ollama", "models": ["codellama", "deepseek-coder", "llama3", "mistral"]})
         return available
 
+    def _has_credentials(self, model_key: str) -> bool:
+        """Check if the API key for a model's provider is configured."""
+        if model_key not in AVAILABLE_MODELS:
+            return False
+        provider = AVAILABLE_MODELS[model_key].provider
+        if provider == LLMProvider.OPENAI:
+            return bool(self.openai_key)
+        if provider == LLMProvider.ANTHROPIC:
+            return bool(self.anthropic_key)
+        if provider == LLMProvider.GEMINI:
+            return bool(self.gemini_key)
+        if provider == LLMProvider.GROQ:
+            return bool(self.groq_key)
+        if provider == LLMProvider.OLLAMA:
+            return True
+        return False
+
     async def generate(
         self,
         prompt: str,
@@ -139,13 +156,14 @@ class LLMClient:
         """Generate a response from the specified model with automated fallback."""
         import time
         start = time.time()
+        TOTAL_BUDGET = 40  # hard cap in seconds — never exceed this
 
         if model_key not in AVAILABLE_MODELS:
             return LLMResponse(content="", provider="unknown", model=model_key,
                              error=f"Unknown model: {model_key}")
-        
+
         config = AVAILABLE_MODELS[model_key]
-        
+
         # Build context-aware prompt
         full_prompt = prompt
         if context:
@@ -165,32 +183,41 @@ class LLMClient:
             else:
                 return LLMResponse(content="", provider=m_config.provider, model=m_key, error="Provider not implemented")
 
+        async def _timed_call(m_key: str, m_config: ModelConfig) -> LLMResponse:
+            remaining = TOTAL_BUDGET - (time.time() - start)
+            if remaining <= 2:
+                raise TimeoutError("Time budget exhausted")
+            return await asyncio.wait_for(_attempt_call(m_key, m_config), timeout=min(remaining, 30))
+
         try:
-            result = await _attempt_call(model_key, config)
+            result = await _timed_call(model_key, config)
             result.latency_ms = (time.time() - start) * 1000
             return result
         except Exception as e:
             logger.warning(f"Primary model {model_key} failed: {e}")
-            
+
             if not use_fallback:
                  return LLMResponse(content="", provider=config.provider.value, model=model_key,
                                  error=str(e), latency_ms=(time.time() - start) * 1000)
 
-            # Fallback chain
-            fallbacks = ["gemini-2.0-flash", "gpt-4o-mini", "claude-3-haiku"]
+            # Fallback chain — pre-filtered to models with configured API keys
+            fallbacks = [
+                f_key for f_key in ["gemini-2.0-flash", "gpt-4o-mini", "claude-3-haiku"]
+                if f_key != model_key and self._has_credentials(f_key)
+            ]
             for f_key in fallbacks:
-                if f_key == model_key or f_key not in AVAILABLE_MODELS:
-                    continue
-                
+                if (time.time() - start) >= TOTAL_BUDGET - 2:
+                    break
+
                 f_config = AVAILABLE_MODELS[f_key]
                 try:
                     logger.info(f"Attempting fallback to {f_key}...")
-                    result = await _attempt_call(f_key, f_config)
+                    result = await _timed_call(f_key, f_config)
                     result.latency_ms = (time.time() - start) * 1000
                     return result
                 except Exception as fe:
                     logger.warning(f"Fallback {f_key} failed: {fe}")
-            
+
             return LLMResponse(content="", provider=config.provider.value, model=model_key,
                              error=f"All models failed. Last error: {e}", latency_ms=(time.time() - start) * 1000)
 
@@ -220,7 +247,7 @@ class LLMClient:
         if not self.openai_key:
             raise ValueError("OPENAI_API_KEY not configured")
         import httpx
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"},
@@ -247,7 +274,7 @@ class LLMClient:
         if not self.anthropic_key:
             raise ValueError("ANTHROPIC_API_KEY not configured")
         import httpx
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -276,7 +303,7 @@ class LLMClient:
             raise ValueError("GEMINI_API_KEY not configured")
         import httpx
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.model_id}:generateContent?key={self.gemini_key}"
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 url,
                 json={
@@ -294,7 +321,7 @@ class LLMClient:
         if not self.groq_key:
             raise ValueError("GROQ_API_KEY not configured")
         import httpx
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"},
