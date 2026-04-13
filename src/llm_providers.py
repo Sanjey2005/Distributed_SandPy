@@ -73,8 +73,9 @@ Rules:
 1. Return ONLY the Python code — no markdown fences, no explanations
 2. The code runs in a Jupyter kernel where pandas, numpy, matplotlib are pre-imported
 3. Use print() statements to display results
-8. NEVER use `input()` or write interactive CLI terminal apps. NEVER use Desktop GUI libraries like `tkinter`, `PyQt`, `turtle`, or `pygame` as there is no display attached.
-9. If any "App" is requested, you MUST write a Web App using FastAPI with uvicorn (NOT Flask — it is not installed) bound to 0.0.0.0:8000. Set `allow_reuse_address = True`.
+4. NEVER use `input()` or write interactive CLI terminal apps. NEVER use Desktop GUI libraries like `tkinter`, `PyQt`, `turtle`, or `pygame` as there is no display attached.
+5. If any "App" is requested, you MUST write a Web App using FastAPI with uvicorn (NOT Flask — it is not installed) bound to 0.0.0.0:8000. Set `allow_reuse_address = True`.
+6. When building ANY web app, ALWAYS serve a complete HTML/CSS/JS frontend from the root route '/' using FastAPI's HTMLResponse. The frontend must be styled, interactive, and visually polished. Use inline CSS and JS in the HTML string. Never return only bare JSON API endpoints without a user-facing UI.
 """
 
 ERROR_EXPLANATION_SYSTEM_PROMPT = """You are an expert Python debugger and teacher.
@@ -156,7 +157,7 @@ class LLMClient:
         """Generate a response from the specified model with automated fallback."""
         import time
         start = time.time()
-        TOTAL_BUDGET = 40  # hard cap in seconds — never exceed this
+        TOTAL_BUDGET = 25  # hard cap in seconds — never exceed this
 
         if model_key not in AVAILABLE_MODELS:
             return LLMResponse(content="", provider="unknown", model=model_key,
@@ -187,7 +188,7 @@ class LLMClient:
             remaining = TOTAL_BUDGET - (time.time() - start)
             if remaining <= 2:
                 raise TimeoutError("Time budget exhausted")
-            return await asyncio.wait_for(_attempt_call(m_key, m_config), timeout=min(remaining, 30))
+            return await asyncio.wait_for(_attempt_call(m_key, m_config), timeout=min(remaining, 25))
 
         try:
             result = await _timed_call(model_key, config)
@@ -321,7 +322,7 @@ class LLMClient:
         if not self.groq_key:
             raise ValueError("GROQ_API_KEY not configured")
         import httpx
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"},

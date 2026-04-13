@@ -8,7 +8,9 @@ import sys
 import time
 import json
 import asyncio
+import re
 import logging
+import importlib.util
 
 logger = logging.getLogger(__name__)
 import queue
@@ -411,6 +413,17 @@ print("Environment ready.")
 
 @app.post("/execute")
 async def execute_code(request: ExecuteRequest):
+    # Auto-start session if it doesn't exist yet
+    if request.user_id not in sessions:
+        await start_session(request.user_id)
+
+    # Server code blocks the kernel forever — tell user to deploy instead
+    if _code_has_server(request.code):
+        return {
+            "output": "This code starts a web server and cannot run inside the kernel.\nUse the 'Auto Deploy' button to launch it as a background service.",
+            "images": [],
+        }
+
     session_info = await get_session(request.user_id)
     try:
         result = await session_info.controller.execute_code(request.code)
@@ -765,7 +778,6 @@ active_services = {}
 
 def _code_has_server(code: str) -> bool:
     """Check if code already contains a real web server by looking for import statements."""
-    import re
     # Only match actual import lines, not random keyword mentions like app.run()
     patterns = [
         r'^\s*from\s+flask\s+import',
@@ -825,6 +837,69 @@ HTTPServer(("0.0.0.0", {port}), _Handler).serve_forever()
 '''
 
 
+_STDLIB_MODULES = {
+    'sys', 'os', 'io', 're', 'json', 'math', 'time', 'datetime', 'collections',
+    'functools', 'itertools', 'pathlib', 'typing', 'asyncio', 'subprocess',
+    'threading', 'multiprocessing', 'http', 'urllib', 'socket', 'logging',
+    'hashlib', 'base64', 'csv', 'pickle', 'copy', 'abc', 'enum', 'dataclasses',
+    'contextlib', 'shutil', 'tempfile', 'glob', 'string', 'textwrap', 'uuid',
+    'argparse', 'configparser', 'struct', 'array', 'queue', 'heapq', 'bisect',
+    'statistics', 'random', 'secrets', 'html', 'xml', 'email', 'mimetypes',
+    'unittest', 'pdb', 'traceback', 'warnings', 'inspect', 'dis', 'ast',
+    'token', 'tokenize', 'pprint', 'decimal', 'fractions', 'operator',
+    'signal', 'select', 'selectors', 'platform', 'sysconfig', 'importlib',
+    # Pre-installed in worker container
+    'pandas', 'numpy', 'matplotlib', 'scipy', 'seaborn', 'sklearn',
+    'pyarrow', 'tabulate', 'openpyxl', 'xlrd', 'redis', 'httpx',
+    'cloudpickle', 'fastapi', 'uvicorn', 'pydantic', 'nbformat',
+}
+
+_SVC_MODULE_TO_PACKAGE = {
+    "cv2": "opencv-python", "sklearn": "scikit-learn", "PIL": "Pillow",
+    "bs4": "beautifulsoup4", "yaml": "pyyaml", "dotenv": "python-dotenv",
+    "skimage": "scikit-image", "dateutil": "python-dateutil",
+    "docx": "python-docx", "pptx": "python-pptx", "fitz": "PyMuPDF",
+    "attr": "attrs", "serial": "pyserial", "Crypto": "pycryptodome",
+}
+
+
+def _extract_all_imports(code: str) -> set:
+    """Extract all top-level imported module names from code."""
+    modules = set()
+    for line in code.splitlines():
+        m = re.match(r'^\s*import\s+(\w+)', line)
+        if m:
+            modules.add(m.group(1))
+        m = re.match(r'^\s*from\s+(\w+)', line)
+        if m:
+            modules.add(m.group(1))
+    return modules
+
+
+def _install_missing_packages(code: str) -> list:
+    """Detect and pip-install any missing non-stdlib packages referenced in code."""
+    modules = _extract_all_imports(code)
+    installed = []
+    for mod in modules:
+        if mod in _STDLIB_MODULES:
+            continue
+        if importlib.util.find_spec(mod) is not None:
+            continue
+        pkg = _SVC_MODULE_TO_PACKAGE.get(mod, mod)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", pkg],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=120
+            )
+            if result.returncode == 0:
+                installed.append(pkg)
+                logger.info(f"Auto-installed package for service: {pkg}")
+        except Exception as e:
+            logger.warning(f"Failed to install {pkg}: {e}")
+    return installed
+
+
 @app.post("/services/start")
 async def start_service(req: StartServiceRequest):
     if req.service_id in active_services:
@@ -836,6 +911,9 @@ async def start_service(req: StartServiceRequest):
 
     deploy_code = wrap_code_with_server(req.code, req.port)
 
+    # Pre-install any missing packages before launching
+    _install_missing_packages(deploy_code)
+
     service_dir = os.path.join(BASE_FOLDER, "services", req.user_id, req.service_id)
     os.makedirs(service_dir, exist_ok=True)
     file_path = os.path.join(service_dir, "app.py")
@@ -843,36 +921,54 @@ async def start_service(req: StartServiceRequest):
         f.write(deploy_code)
 
     log_path = os.path.join(service_dir, "output.log")
-    try:
-        log_file = open(log_path, "w")
-        process = subprocess.Popen(
-            ["python", "app.py"],
-            cwd=service_dir,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-        )
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            log_file = open(log_path, "w")
+            process = subprocess.Popen(
+                ["python", "app.py"],
+                cwd=service_dir,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
 
-        # Brief check — give the process a moment to crash on import/syntax errors
-        import time
-        time.sleep(0.5)
-        if process.poll() is not None:
-            log_file.close()
-            with open(log_path) as f:
-                error_output = f.read()
-            raise HTTPException(status_code=500, detail=f"Service crashed on startup: {error_output[:500]}")
+            # Brief check — give the process a moment to crash on import/syntax errors
+            await asyncio.sleep(0.5)
+            if process.poll() is not None:
+                log_file.close()
+                with open(log_path) as f:
+                    error_output = f.read()
 
-        active_services[req.service_id] = {
-            "process": process,
-            "port": req.port,
-            "dir": service_dir,
-            "user_id": req.user_id,
-            "log_file": log_file,
-        }
-        return {"status": "started", "service_id": req.service_id, "port": req.port}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+                # If missing module, install it and retry
+                mod_match = re.search(
+                    r"ModuleNotFoundError: No module named ['\"]([^'\"\.]+)", error_output
+                )
+                if mod_match and attempt < max_attempts:
+                    mod = mod_match.group(1)
+                    pkg = _SVC_MODULE_TO_PACKAGE.get(mod, mod)
+                    logger.info(f"Service crashed: missing {mod}. Installing {pkg} (attempt {attempt})...")
+                    subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "-q", pkg],
+                        timeout=120
+                    )
+                    continue
+
+                raise HTTPException(status_code=500, detail=f"Service crashed on startup: {error_output[:500]}")
+
+            active_services[req.service_id] = {
+                "process": process,
+                "port": req.port,
+                "dir": service_dir,
+                "user_id": req.user_id,
+                "log_file": log_file,
+            }
+            return {"status": "started", "service_id": req.service_id, "port": req.port}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    raise HTTPException(status_code=500, detail="Service failed to start after multiple attempts.")
 
 @app.delete("/services/stop/{service_id}")
 async def stop_service(service_id: str):

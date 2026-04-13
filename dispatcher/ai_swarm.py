@@ -5,6 +5,7 @@ After the swarm completes, the generated code is sent to the frontend.
 Deployment is handled separately via the "Auto Deploy" button.
 """
 import os
+import re
 import json
 import logging
 import asyncio
@@ -26,7 +27,7 @@ WORKER_URLS = {
 # How long (seconds) to wait for code to execute on a worker before giving up
 EXEC_TIMEOUT = 30
 # How long to wait for LLM generation
-LLM_TIMEOUT = 45
+LLM_TIMEOUT = 30
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
@@ -56,6 +57,27 @@ def extract_code(resp_content: str) -> str:
 def _is_simple_prompt(prompt: str) -> bool:
     """Return True for short, straightforward prompts that don't need a planning step."""
     return len(prompt.strip().split()) <= 15
+
+
+_MODULE_TO_PACKAGE = {
+    "cv2": "opencv-python", "sklearn": "scikit-learn", "PIL": "Pillow",
+    "bs4": "beautifulsoup4", "yaml": "pyyaml", "dotenv": "python-dotenv",
+    "skimage": "scikit-image", "dateutil": "python-dateutil",
+    "docx": "python-docx", "pptx": "python-pptx", "fitz": "PyMuPDF",
+    "attr": "attrs", "serial": "pyserial", "Crypto": "pycryptodome",
+}
+
+
+def _extract_missing_module(output: str) -> Optional[str]:
+    """Extract module name from ModuleNotFoundError/ImportError in output."""
+    match = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"\.]+)", output)
+    if not match:
+        match = re.search(r"ImportError: No module named ['\"]([^'\"\.]+)", output)
+    if match:
+        module = match.group(1)
+        if re.fullmatch(r'[A-Za-z0-9_-]+', module):
+            return module
+    return None
 
 
 async def pick_healthy_worker() -> Optional[str]:
@@ -153,7 +175,10 @@ async def execute_autonomous_swarm(req: SwarmRequest, websocket_callback=None):
             "Generate ONLY raw Python code — no markdown fences, no explanations. "
             "The code runs in a Jupyter kernel where pandas, numpy, matplotlib are available. "
             "Use print() to show results. "
-            "If a web server is needed, bind to 0.0.0.0:8000."
+            "If a web app or server is needed, use FastAPI with uvicorn (NOT Flask — it is not installed). "
+            "Bind to host='0.0.0.0', port=8000. "
+            "When building ANY web app, ALWAYS serve a complete HTML/CSS/JS frontend from the root route '/' using FastAPI's HTMLResponse. "
+            "The frontend must be styled, interactive, and visually polished — never return only bare JSON API endpoints without a UI."
         )
         coder_prompt = (
             f"Write Python code for: {req.prompt}" if is_simple
@@ -187,6 +212,8 @@ async def execute_autonomous_swarm(req: SwarmRequest, websocket_callback=None):
             }
 
         log_event("evaluator", f"Worker found. Running code (timeout: {EXEC_TIMEOUT}s)...")
+
+        installed_pkgs = set()
 
         for loop in range(req.max_loops):
             attempt = loop + 1
@@ -222,6 +249,25 @@ async def execute_autonomous_swarm(req: SwarmRequest, websocket_callback=None):
                     "final_code": current_code,
                     "final_output": result["output"],
                 }
+
+            # Auto-install missing dependencies before involving the debugger
+            missing = _extract_missing_module(result["output"])
+            if missing and missing not in installed_pkgs:
+                pkg = _MODULE_TO_PACKAGE.get(missing, missing)
+                log_event("evaluator", f"Auto-installing missing package: {pkg}...", status="running")
+                try:
+                    async with httpx.AsyncClient(timeout=120) as client:
+                        install_resp = await client.post(
+                            f"{worker_url}/install_package",
+                            json={"user_id": req.user_id, "package_name": pkg}
+                        )
+                        if install_resp.status_code == 200:
+                            installed_pkgs.add(missing)
+                            log_event("evaluator", f"Installed {pkg}. Retrying...", status="running")
+                            continue
+                except Exception:
+                    pass
+                log_event("evaluator", f"Could not install {pkg}.", status="warning")
 
             # Execution failed — hand off to Debugger
             log_event("evaluator", "Execution failed. Sending to Debugger...", {"output": result["output"]}, status="failed")

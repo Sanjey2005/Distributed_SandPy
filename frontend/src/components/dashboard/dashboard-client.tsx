@@ -138,6 +138,8 @@ export function DashboardClient() {
     setIsSubmitting(true);
     try {
       const service_id = crypto.randomUUID();
+      let deployed = false;
+      let lastError = "";
       for (const worker of WORKERS) {
         try {
           const resp = await fetch(`${worker.url}/services/start`, {
@@ -145,10 +147,17 @@ export function DashboardClient() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ service_id, user_id: user?.user_id, code, port: 8000 }),
           });
-          if (resp.ok) break;
+          if (resp.ok) { deployed = true; break; }
+          const err = await resp.json().catch(() => ({}));
+          lastError = typeof err.detail === "string" ? err.detail : resp.statusText;
         } catch { /* worker unreachable, try next */ }
       }
-      setTab("services");
+      if (deployed) {
+        setTab("services");
+      } else {
+        setOutput({ output: `Deploy failed: ${lastError || "All worker nodes are unreachable."}` });
+        setTab("output");
+      }
     } finally { setIsSubmitting(false); }
   };
   
@@ -166,9 +175,21 @@ export function DashboardClient() {
 
   const apiCall = async (endpoint: string, options: any = {}) => {
     try {
-      const res = await fetch(`${activeWorker.url}${endpoint}`, {
-        ...options, headers: { "Content-Type": "application/json", ...options.headers }
-      });
+      let res: Response | null = null;
+      let lastErr: any = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          res = await fetch(`${activeWorker.url}${endpoint}`, {
+            ...options, headers: { "Content-Type": "application/json", ...options.headers }
+          });
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+      if (lastErr || !res) throw lastErr;
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail?.error || (typeof err.detail === 'string' ? err.detail : null) || res.statusText || "Communication Failure");
@@ -191,7 +212,7 @@ export function DashboardClient() {
           } catch { }
         }
       }
-      throw e;
+      throw new Error("All worker nodes are unreachable. Ensure Docker containers are running.");
     }
   };
 
